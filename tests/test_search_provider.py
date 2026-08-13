@@ -193,6 +193,147 @@ class TestDetectSourceFromUrl:
 # WebSearchProvider (mock engine — no live HTTP)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestWebSearchProviderLiveClassification:
+    def test_ddg_202_challenge_response_is_classified_as_challenge(self):
+        class FakeResponse:
+            status_code = 202
+            text = """
+<!DOCTYPE html>
+<html>
+<body>
+<h1>DuckDuckGo</h1>
+<form id="challenge-form" action="//duckduckgo.com/anomaly.js">
+    <div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div>
+</form>
+</body>
+</html>
+"""
+
+        class FakeHTTP:
+            def get(self, url, timeout=15, headers=None):
+                return FakeResponse()
+
+        provider = WebSearchProvider(http_client=FakeHTTP(), search_engine="ddg", request_delay=0)
+        with pytest.raises(SearchProviderError) as exc:
+            provider._ddg_search("Python Developer Chennai site:naukri.com", max_results=5)
+        assert exc.value.classification == "SEARCH_CHALLENGED"
+
+    def test_ddg_403_is_classified_as_http_error(self):
+        class FakeResponse:
+            status_code = 403
+            text = "Forbidden"
+
+        class FakeHTTP:
+            def get(self, url, timeout=15, headers=None):
+                return FakeResponse()
+
+        provider = WebSearchProvider(http_client=FakeHTTP(), search_engine="ddg", request_delay=0)
+        with pytest.raises(SearchProviderError) as exc:
+            provider._ddg_search("Python Developer Chennai site:naukri.com", max_results=5)
+        assert exc.value.classification == "SEARCH_HTTP_ERROR"
+
+    def test_ddg_429_is_classified_as_rate_limited(self):
+        class FakeResponse:
+            status_code = 429
+            text = "Rate limit"
+
+        class FakeHTTP:
+            def get(self, url, timeout=15, headers=None):
+                return FakeResponse()
+
+        provider = WebSearchProvider(http_client=FakeHTTP(), search_engine="ddg", request_delay=0)
+        with pytest.raises(RateLimitedError) as exc:
+            provider._ddg_search("Python Developer Chennai site:naukri.com", max_results=5)
+        assert exc.value.classification == "SEARCH_RATE_LIMITED"
+
+    def test_ddg_timeout_is_classified_as_network_error(self):
+        class FakeHTTP:
+            def get(self, url, timeout=15, headers=None):
+                raise TimeoutError("request timed out")
+
+        provider = WebSearchProvider(http_client=FakeHTTP(), search_engine="ddg", request_delay=0)
+        with pytest.raises(SearchProviderError) as exc:
+            provider._ddg_search("Python Developer Chennai site:naukri.com", max_results=5)
+        assert exc.value.classification == "SEARCH_NETWORK_ERROR"
+
+    def test_ddg_socket_error_is_classified_as_network_error(self):
+        class FakeHTTP:
+            def get(self, url, timeout=15, headers=None):
+                raise OSError("socket connection refused")
+
+        provider = WebSearchProvider(http_client=FakeHTTP(), search_engine="ddg", request_delay=0)
+        with pytest.raises(SearchProviderError) as exc:
+            provider._ddg_search("Python Developer Chennai site:naukri.com", max_results=5)
+        assert exc.value.classification == "SEARCH_NETWORK_ERROR"
+
+    def test_ddg_zero_result_page_returns_empty_list(self):
+        class FakeResponse:
+            status_code = 200
+            text = """
+<!doctype html>
+<html>
+<body>
+  <div class="search-results">
+    <h1>No results</h1>
+  </div>
+</body>
+</html>
+"""
+
+        class FakeHTTP:
+            def get(self, url, timeout=15, headers=None):
+                return FakeResponse()
+
+        provider = WebSearchProvider(http_client=FakeHTTP(), search_engine="ddg", request_delay=0)
+        results = provider._ddg_search("Python Developer Chennai", max_results=5)
+        assert results == []
+
+    def test_ddg_malformed_html_page_returns_empty_list(self):
+        class FakeResponse:
+            status_code = 200
+            text = """
+<!doctype html>
+<html>
+<body>
+  <div class="result">
+    <h2 class="result__title"><a href="https://naukri.com/job/123">Python Developer Chennai
+    <div class="result__snippet">Build APIs and dashboards
+"""
+
+        class FakeHTTP:
+            def get(self, url, timeout=15, headers=None):
+                return FakeResponse()
+
+        provider = WebSearchProvider(http_client=FakeHTTP(), search_engine="ddg", request_delay=0)
+        with pytest.raises(SearchProviderError) as exc:
+            provider._ddg_search("Python Developer Chennai site:naukri.com", max_results=5)
+        assert exc.value.classification == "SEARCH_PARSE_ERROR"
+
+    def test_ddg_result_page_returns_parsed_search_hits(self):
+        class FakeResponse:
+            status_code = 200
+            text = """
+<!doctype html>
+<html>
+<body>
+  <div class="result">
+    <h2 class="result__title"><a href="https://naukri.com/job/123">Python Developer Chennai</a></h2>
+    <div class="result__snippet">Build APIs and dashboards</div>
+  </div>
+</body>
+</html>
+"""
+
+        class FakeHTTP:
+            def get(self, url, timeout=15, headers=None):
+                return FakeResponse()
+
+        provider = WebSearchProvider(http_client=FakeHTTP(), search_engine="ddg", request_delay=0)
+        results = provider._ddg_search("Python Developer Chennai site:naukri.com", max_results=5)
+        assert len(results) == 1
+        assert results[0]["url"] == "https://naukri.com/job/123"
+
+
 class TestWebSearchProviderMock:
     """WebSearchProvider with engine='mock' returns empty lists (no HTTP)."""
 

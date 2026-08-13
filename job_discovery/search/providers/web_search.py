@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -105,6 +106,7 @@ class WebSearchProvider(SearchProvider):
         self._http = http_client
         self._engine = search_engine
         self._delay = request_delay
+        self.failure_log: List[Dict[str, Any]] = []
 
     @property
     def provider_name(self) -> str:
@@ -130,15 +132,55 @@ class WebSearchProvider(SearchProvider):
         """
         sources = source_filter or list(SOURCE_DOMAINS.keys())
         all_results: List[ProviderSearchResult] = []
+        failures = 0
+        if not sources:
+            logger.info("SEARCH_SUCCESS_WITH_ZERO_RESULTS query=%r source_filter=%r reason=no-source-targets", query, source_filter)
+            return []
+
         per_source = max(1, max_results // len(sources))
+        logger.info(
+            "SEARCH_DISCOVERY_START query=%r source_filter=%s max_results=%s per_source=%s",
+            query,
+            sources,
+            max_results,
+            per_source,
+        )
 
         for source_name in sources:
             domain = SOURCE_DOMAINS.get(source_name)
             if not domain:
+                logger.warning(
+                    "SEARCH_PARSE_ERROR source=%s status=SEARCH_PARSE_ERROR query=%r reason=unknown-source-domain",
+                    source_name,
+                    query,
+                )
                 continue
+
             scoped_query = f"{query} site:{domain}"
+            engine_url = self.build_scoped_url(query, source_name)
+            logger.info(
+                "DISCOVERY_BUILD source=%s generated_query=%r final_site_scoped_query=%r search_engine_url=%s",
+                source_name,
+                query,
+                scoped_query,
+                engine_url,
+            )
             try:
                 raw = self._execute_search(scoped_query, max_results=per_source)
+                if raw:
+                    logger.info(
+                        "DISCOVERY_SEARCH_RESULT source=%s query=%r parsed_results=%d success_status=SEARCH_SUCCESS",
+                        source_name,
+                        query,
+                        len(raw),
+                    )
+                else:
+                    logger.info(
+                        "DISCOVERY_SEARCH_RESULT source=%s query=%r parsed_results=%d success_status=SEARCH_SUCCESS_WITH_ZERO_RESULTS",
+                        source_name,
+                        query,
+                        len(raw),
+                    )
                 for rank, item in enumerate(raw, start=1):
                     url = item.get("url", "")
                     detected = detect_source_from_url(url) or source_name
@@ -152,20 +194,101 @@ class WebSearchProvider(SearchProvider):
                         rank=rank,
                     )
                     all_results.append(result)
-            except RateLimitedError:
-                logger.warning(
-                    "Rate limited on source=%s, query=%r — recording and skipping",
+            except RateLimitedError as exc:
+                failures += 1
+                self._record_failure(
                     source_name,
                     query,
+                    scoped_query,
+                    engine_url,
+                    exc,
+                )
+                logger.error(
+                    "SEARCH_RATE_LIMITED source=%s query=%r final_site_scoped_query=%r search_engine_url=%s reason=%s",
+                    source_name,
+                    query,
+                    scoped_query,
+                    engine_url,
+                    exc,
                 )
             except SearchProviderError as exc:
-                logger.warning(
-                    "Search failed for source=%s: %s", source_name, exc
+                failures += 1
+                self._record_failure(
+                    source_name,
+                    query,
+                    scoped_query,
+                    engine_url,
+                    exc,
+                )
+                classification = getattr(exc, "classification", "SEARCH_HTTP_ERROR")
+                logger.error(
+                    "SEARCH_FAILURE source=%s query=%r final_site_scoped_query=%r search_engine_url=%s classification=%s http_status=%s reason=%s",
+                    source_name,
+                    query,
+                    scoped_query,
+                    engine_url,
+                    classification,
+                    exc.http_status if hasattr(exc, "http_status") else None,
+                    exc,
+                )
+            except Exception as exc:
+                failures += 1
+                self._record_failure(
+                    source_name,
+                    query,
+                    scoped_query,
+                    engine_url,
+                    SearchProviderError(
+                        str(exc),
+                        classification="SEARCH_NETWORK_ERROR",
+                        provider=self.provider_name,
+                        source=source_name,
+                        query=query,
+                        reason=str(exc),
+                    ),
+                )
+                logger.error(
+                    "SEARCH_NETWORK_ERROR source=%s query=%r final_site_scoped_query=%r search_engine_url=%s reason=%s",
+                    source_name,
+                    query,
+                    scoped_query,
+                    engine_url,
+                    exc,
                 )
             if self._delay > 0:
                 time.sleep(self._delay)
 
+        if not all_results and failures:
+            logger.error(
+                "DISCOVERY_FAILURE_SUMMARY query=%r provider=%s failures=%s parsed_results=%s",
+                query,
+                self.provider_name,
+                failures,
+                len(all_results),
+            )
+
         return all_results[:max_results]
+
+    def _record_failure(
+        self,
+        source_name: str,
+        query: str,
+        site_scoped_query: str,
+        search_engine_url: str,
+        exc: Exception,
+    ) -> None:
+        detail = {
+            "provider": self.provider_name,
+            "source": source_name,
+            "query": query,
+            "site_scoped_query": site_scoped_query,
+            "search_engine_url": search_engine_url,
+            "http_status": getattr(exc, "http_status", None),
+            "classification": getattr(exc, "classification", "SEARCH_NETWORK_ERROR"),
+            "reason": getattr(exc, "reason", str(exc)) or str(exc),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self.failure_log.append(detail)
 
     def build_scoped_url(self, query: str, source_name: str) -> Optional[str]:
         """
@@ -215,29 +338,161 @@ class WebSearchProvider(SearchProvider):
             logger.warning(
                 "beautifulsoup4 not installed — DuckDuckGo parsing unavailable"
             )
-            return []
+            raise SearchProviderError("SEARCH_PARSE_ERROR: beautifulsoup4 unavailable")
 
         url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+        }
         try:
-            resp = self._http.get(url, timeout=15)
+            try:
+                resp = self._http.get(url, timeout=15, headers=headers)
+            except TypeError:
+                resp = self._http.get(url, timeout=15)
         except Exception as exc:
-            raise SearchProviderError(f"HTTP error: {exc}") from exc
+            logger.error("SEARCH_NETWORK_ERROR query=%r engine_url=%s reason=%s", query, url, exc)
+            raise SearchProviderError(
+                f"SEARCH_NETWORK_ERROR: HTTP error: {exc}",
+                classification="SEARCH_NETWORK_ERROR",
+                provider=self.provider_name,
+                query=query,
+                reason=str(exc),
+            ) from exc
+
+        response_text = resp.text or ""
+        logger.info(
+            "SEARCH_ENGINE_TRACE query=%r engine_url=%s source=%s status=%s content_length=%s",
+            query,
+            url,
+            "ddg",
+            resp.status_code,
+            len(response_text),
+        )
+
+        if resp.status_code == 200 and self._looks_malformed_html(response_text):
+            logger.error(
+                "SEARCH_PARSE_ERROR query=%r engine_url=%s status=%s content_length=%s reason=malformed-html-shape",
+                query,
+                url,
+                resp.status_code,
+                len(response_text),
+            )
+            raise SearchProviderError(
+                "SEARCH_PARSE_ERROR: malformed HTML response from search engine",
+                classification="SEARCH_PARSE_ERROR",
+                provider=self.provider_name,
+                query=query,
+                http_status=resp.status_code,
+                reason="Malformed HTML response from search engine",
+            )
 
         if resp.status_code == 429:
-            raise RateLimitedError("DuckDuckGo rate limit")
+            logger.error(
+                "SEARCH_RATE_LIMITED query=%r engine_url=%s status=%s content_length=%s",
+                query,
+                url,
+                resp.status_code,
+                len(response_text),
+            )
+            raise RateLimitedError(
+                "DuckDuckGo rate limit",
+                provider=self.provider_name,
+                query=query,
+                http_status=429,
+                reason="DuckDuckGo rate limit",
+            )
+        if resp.status_code == 403:
+            logger.error(
+                "SEARCH_HTTP_ERROR query=%r engine_url=%s status=%s content_length=%s reason=http_403_forbidden",
+                query,
+                url,
+                resp.status_code,
+                len(response_text),
+            )
+            raise SearchProviderError(
+                "SEARCH_HTTP_ERROR: HTTP 403 forbidden",
+                classification="SEARCH_HTTP_ERROR",
+                provider=self.provider_name,
+                query=query,
+                http_status=403,
+                reason="HTTP 403 forbidden",
+            )
+        if resp.status_code == 202:
+            logger.error(
+                "SEARCH_CHALLENGED query=%r engine_url=%s status=%s content_length=%s reason=duckduckgo-html-challenge-page-202",
+                query,
+                url,
+                resp.status_code,
+                len(response_text),
+            )
+            raise SearchProviderError(
+                "SEARCH_CHALLENGED: DuckDuckGo returned 202 challenge page",
+                classification="SEARCH_CHALLENGED",
+                provider=self.provider_name,
+                query=query,
+                http_status=202,
+                reason="DuckDuckGo HTML returned 202 challenge page",
+            )
         if resp.status_code != 200:
-            raise SearchProviderError(f"HTTP {resp.status_code}")
+            logger.error(
+                "SEARCH_HTTP_ERROR query=%r engine_url=%s status=%s content_length=%s",
+                query,
+                url,
+                resp.status_code,
+                len(response_text),
+            )
+            raise SearchProviderError(
+                f"SEARCH_HTTP_ERROR: HTTP {resp.status_code}",
+                classification="SEARCH_HTTP_ERROR",
+                provider=self.provider_name,
+                query=query,
+                http_status=resp.status_code,
+                reason=f"HTTP {resp.status_code}",
+            )
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = BeautifulSoup(response_text, "html.parser")
+        challenge_form = soup.select_one("#challenge-form") or soup.select_one("form#challenge-form")
+        anomaly_form = soup.select_one("#anomaly-form") or soup.select_one("form#img-form")
+        body_text = soup.get_text(" ", strip=True).lower()
+        challenge_markers = (
+            "unfortunately, bots use duckduckgo too"
+            in body_text
+            or "select all squares containing a duck" in body_text
+            or "challenge" in body_text
+            or "anomaly" in body_text
+            or challenge_form is not None
+            or anomaly_form is not None
+        )
+        if challenge_markers:
+            logger.error(
+                "SEARCH_CHALLENGED query=%r engine_url=%s status=%s content_length=%s reason=duckduckgo-bot-challenge-page",
+                query,
+                url,
+                resp.status_code,
+                len(response_text),
+            )
+            raise SearchProviderError(
+                "SEARCH_CHALLENGED: DuckDuckGo HTML returned bot-challenge page",
+                classification="SEARCH_CHALLENGED",
+                provider=self.provider_name,
+                query=query,
+                http_status=resp.status_code,
+                reason="DuckDuckGo HTML returned bot-challenge page",
+            )
+
         results: List[Dict[str, Any]] = []
-
-        for item in soup.select(".result"):
-            title_el = item.select_one(".result__title a")
+        items = soup.select(".result")
+        logger.info("SEARCH_HTML_PARSE query=%r result_nodes=%d", query, len(items))
+        for item in items:
+            title_el = item.select_one(".result__title a") or item.select_one(".result__a") or item.select_one("a.result__a")
             snippet_el = item.select_one(".result__snippet")
             if not title_el:
+                logger.warning("SEARCH_PARSE_ERROR query=%r status=SEARCH_PARSE_ERROR reason=result-node-without-title", query)
                 continue
             href = title_el.get("href", "")
-            # DDG redirect URLs — extract actual URL
             if href.startswith("//duckduckgo.com/l/?"):
                 from urllib.parse import parse_qs, urlparse as _up
                 qs = parse_qs(_up(href).query)
@@ -252,4 +507,33 @@ class WebSearchProvider(SearchProvider):
             if len(results) >= max_results:
                 break
 
+        if resp.status_code == 200 and len(results) == 0:
+            logger.info(
+                "SEARCH_SUCCESS_WITH_ZERO_RESULTS query=%r engine_url=%s status=%s content_length=%s parsed_results=0",
+                query,
+                url,
+                resp.status_code,
+                len(response_text),
+            )
         return results
+
+    def _looks_malformed_html(self, response_text: str) -> bool:
+        """Heuristic for malformed DDG HTML that parser recovery could incorrectly accept."""
+        if not response_text:
+            return False
+        text = response_text.lower()
+        if 'class="result"' not in text and 'class="result' not in text:
+            return False
+        if '<a ' in text and '</a>' not in text:
+            return True
+        if '<h2 class="result__title"' in text and '</h2>' not in text:
+            return True
+        if '<div class="result__title"' in text and '</div>' not in text:
+            return True
+        if '<div class="result__snippet"' in text and '</div>' not in text:
+            return True
+        if text.count('<a ') > text.count('</a>'):
+            return True
+        if text.count('<div class="result"') > text.count('</div>'):
+            return True
+        return False

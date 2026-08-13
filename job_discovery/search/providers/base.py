@@ -89,9 +89,63 @@ class SearchProvider(ABC):
         """Unique identifier for this provider (e.g. 'ddg', 'google', 'mock')."""
 
 
-class RateLimitedError(Exception):
+class SearchProviderError(Exception):
+    """Generic search provider failure with provider-level classification."""
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        classification: str = "SEARCH_HTTP_ERROR",
+        provider: str = "web_search",
+        source: Optional[str] = None,
+        query: Optional[str] = None,
+        http_status: Optional[int] = None,
+        reason: Optional[str] = None,
+        timestamp: Optional[datetime] = None,
+    ) -> None:
+        super().__init__(message)
+        self.classification = classification
+        self.provider = provider
+        self.source = source
+        self.query = query
+        self.http_status = http_status
+        self.reason = reason or message
+        self.timestamp = timestamp or datetime.now(timezone.utc)
+
+    def to_dict(self) -> dict:
+        return {
+            "provider": self.provider,
+            "source": self.source,
+            "query": self.query,
+            "http_status": self.http_status,
+            "classification": self.classification,
+            "reason": self.reason,
+            "timestamp": self.timestamp.isoformat(),
+        }
+
+
+class RateLimitedError(SearchProviderError):
     """Raised when the search provider signals rate-limiting."""
 
-
-class SearchProviderError(Exception):
-    """Generic search provider failure."""
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        provider: str = "web_search",
+        source: Optional[str] = None,
+        query: Optional[str] = None,
+        http_status: Optional[int] = None,
+        reason: Optional[str] = None,
+        timestamp: Optional[datetime] = None,
+    ) -> None:
+        super().__init__(
+            message,
+            classification="SEARCH_RATE_LIMITED",
+            provider=provider,
+            source=source,
+            query=query,
+            http_status=http_status,
+            reason=reason or message,
+            timestamp=timestamp,
+        )

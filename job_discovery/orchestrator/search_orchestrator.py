@@ -153,21 +153,40 @@ class SearchOrchestrator:
         settings = self._settings
 
         # 1. Query generation
-        queries = self._query_expander.expand(
-            self._query_builder.build(criteria), max_total=5
+        raw_queries = self._query_builder.build(criteria)
+        queries = self._query_expander.expand(raw_queries, max_total=5)
+        logger.info(
+            "DISCOVERY_QUERY_GENERATED run_id=%s criteria=%s queries=%s",
+            tracker.run_id,
+            criteria.model_dump(exclude_none=True),
+            queries,
         )
         tracker.inc_queries(len(queries))
 
         # 2. Search — skip already-issued queries
         all_results = []
+        source_filter = self._query_builder.get_target_sources(criteria)
         for query in queries:
             if query in already_issued:
                 continue
+            logger.info(
+                "DISCOVERY_SEARCH_REQUEST run_id=%s query=%r source_filter=%s max_results=%s",
+                tracker.run_id,
+                query,
+                source_filter,
+                settings.max_search_results,
+            )
             try:
                 results = self._provider.search(
                     query,
                     max_results=settings.max_search_results,
-                    source_filter=self._query_builder.get_target_sources(criteria),
+                    source_filter=source_filter,
+                )
+                logger.info(
+                    "DISCOVERY_SEARCH_RESPONSE run_id=%s query=%r raw_search_result_count=%s",
+                    tracker.run_id,
+                    query,
+                    len(results),
                 )
                 all_results.extend(results)
                 tracker.mark_query_issued(query)
@@ -176,14 +195,24 @@ class SearchOrchestrator:
                 logger.warning("Search failed for %r: %s", query, exc)
 
         tracker.inc_discovered(len(all_results))
+        logger.info(
+            "DISCOVERY_RAW_RESULTS run_id=%s raw_search_results=%s valid_provider_results=%s",
+            tracker.run_id,
+            len(all_results),
+            len([r for r in all_results if r.url]),
+        )
 
         # 3. URL normalisation + dedup
         new_urls = []
+        duplicate_count = 0
+        valid_count = 0
         for r in all_results:
             norm = self._resolver.resolve(r.url)
             if norm is None:
                 continue
+            valid_count += 1
             if norm.is_duplicate or norm.canonical_url in processed_urls:
+                duplicate_count += 1
                 tracker.inc_duplicate()
                 continue
             try:
@@ -197,6 +226,15 @@ class SearchOrchestrator:
             except Exception:
                 pass
             new_urls.append(norm)
+
+        logger.info(
+            "DISCOVERY_NORMALIZED run_id=%s raw_search_results=%s valid_job_urls=%s normalized_urls=%s duplicate_urls=%s",
+            tracker.run_id,
+            len(all_results),
+            valid_count,
+            len(new_urls),
+            duplicate_count,
+        )
 
         # 4. Fetch + extract + store (one source failure does not stop others)
         robots_cache = RobotsCache(http_client=None)   # fail-open: no real network call
